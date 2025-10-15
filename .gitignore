@@ -1,0 +1,28 @@
+# Ignore all processed and raw data
+/data/
+!/data/README.md
+
+# Ignore all temp files
+/temp/
+!/temp/README.md
+
+# Ignore all parquet and feather files
+*.json
+*.feather
+*.parquet
+# Ignore common image files
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tif
+*.tiff
+*.svg
+*.webp
+
+# Ignore Jupyter notebook checkpoints
+**/.ipynb_checkpoints/
+
+# Ignore VS Code settings
+.vscode/
