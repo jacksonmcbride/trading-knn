@@ -40,46 +40,57 @@ dfc = pd.read_parquet(cand_path)
 if not pd.api.types.is_datetime64_any_dtype(dfc["date_end"]):
     dfc["date_end"] = pd.to_datetime(dfc["date_end"])  # ensure timestamp
 
-# Process in date batches (and half_life) to minimize IO
-group_cols = ["date_end", "half_life"]
-dfc = dfc[["date_end", "half_life", "target", "neighbor", "rank", "distance"]].sort_values(group_cols + ["target", "rank"])  # minimal cols
+# Process in date batches to minimize IO (handle half_life inside date loop)
+group_cols = ["date_end"]
+dfc = dfc[["date_end", "half_life", "target", "neighbor", "rank", "distance"]].sort_values(["date_end", "half_life", "target", "rank"])  # minimal cols
 
 rows = []
 BATCH_ROWS = 100000
 writer = None
 
 total_groups = dfc[group_cols].drop_duplicates().shape[0]
-for key, g in tqdm(dfc.groupby(group_cols), total=total_groups, desc="dates", ncols=80):
-    # Robustly unpack group key
-    if isinstance(key, tuple):
-        date_end, half_life = key
-    else:
-        date_end = key
-        half_life = int(g["half_life"].iloc[0])
-    date_end = pd.Timestamp(date_end)
-    # Tickerset for this date
-    targets = g["target"].unique().tolist()
-    neighbors = g["neighbor"].unique().tolist()
+print(f"Total date groups to process: {total_groups}")
+for key, g_date in tqdm(dfc.groupby(group_cols), total=total_groups, desc="dates", ncols=80):
+    # Unpack key
+    date_end = pd.Timestamp(key if not isinstance(key, tuple) else key[0])
+    # Tickerset for this date across all half_life groups
+    targets = g_date["target"].unique().tolist()
+    neighbors = g_date["neighbor"].unique().tolist()
     cols = sorted(set(targets) | set(neighbors))
     if not cols:
         continue
 
-    # Load only needed columns; restrict to (date_end, date_end + 1y]
+    # Compute global pre-window to cover all half_life groups at this date (super-set, exact slices applied later)
+    # Approx pre length per half-life: ~6*half_life trading days ≈ 6*H * 7/5 calendar days; min 30 days
+    if not g_date["half_life"].empty:
+        pre_days_list = [int(max(30, round(6 * float(h) * 7.0 / 5.0))) for h in g_date["half_life"].unique()]
+        pre_cal_days = max(pre_days_list) if pre_days_list else 30
+    else:
+        pre_cal_days = 30
+    pre_start_global = date_end - pd.Timedelta(days=pre_cal_days)
+
+    # Single read covering both pre-window and post 1y window; then slice
     try:
-        ret = pd.read_parquet(returns_path, columns=cols)
+        ret_all = pd.read_parquet(returns_path, columns=cols)
     except Exception:
-        # Fallback: read full and then prune if columns filter unsupported
-        ret = pd.read_parquet(returns_path)[cols]
-    ret.index = pd.to_datetime(ret.index)
+        ret_all = pd.read_parquet(returns_path)[cols]
+    ret_all.index = pd.to_datetime(ret_all.index)
     end_1y = date_end + HORIZONS["1y"]
-    ret = ret[(ret.index > date_end) & (ret.index <= end_1y)]
+    ret_all = ret_all[(ret_all.index > pre_start_global) & (ret_all.index <= end_1y)]
+    if ret_all.empty:
+        continue
+    # Post and pre slices
+    ret = ret_all[(ret_all.index > date_end) & (ret_all.index <= end_1y)]
+    ret_pre_all = ret_all[(ret_all.index > pre_start_global) & (ret_all.index <= date_end)]
     if ret.empty:
         continue
 
-    # Per target computations
-    for t in targets:
-        if t not in ret.columns:
-            continue
+    # Iterate per half-life within this date to reuse same returns
+    for half_life, g in g_date.groupby("half_life"):
+        # Per target computations
+        for t in targets:
+            if t not in ret.columns:
+                continue
         r_tgt_full = ret[t]
         sub = g[g["target"] == t].sort_values("rank").head(max(K_LIST))
         nbrs = [x for x in sub["neighbor"].tolist() if x in ret.columns]
@@ -90,6 +101,46 @@ for key, g in tqdm(dfc.groupby(group_cols), total=total_groups, desc="dates", nc
 
         # Base weights from distances (L2-style)
         w_base = 1.0 / (np.maximum(dists, EPS) + EPS)
+
+        # Compute hedge ratios b_hat per k using pre-window data (no lookahead)
+        b_hat = {}
+        if t in ret_pre_all.columns and not ret_pre_all.empty:
+            # Slice the global pre window (already loaded) — exact same dates per half-life as before when constrained by masks
+            r_tgt_pre = ret_pre_all[t]
+            R_pre = ret_pre_all[nbrs] if all(n in ret_pre_all.columns for n in nbrs) else ret_pre_all[[c for c in nbrs if c in ret_pre_all.columns]]
+            if not R_pre.empty and t in ret_pre_all.columns:
+                idx_pre = r_tgt_pre.index.intersection(R_pre.index)
+                # Constrain to this half-life's pre-window length to preserve logic
+                pre_days_hl = int(max(30, round(6 * float(half_life) * 7.0 / 5.0)))
+                win_start = date_end - pd.Timedelta(days=pre_days_hl)
+                if len(idx_pre) > 0:
+                    idx_pre = idx_pre[idx_pre > win_start]
+                if not idx_pre.empty:
+                    rt_pre_arr = r_tgt_pre.loc[idx_pre].to_numpy(dtype=np.float32)
+                    Rp_pre_arr = R_pre.loc[idx_pre].to_numpy(dtype=np.float32)
+                    neigh_ok_pre = ~np.isnan(Rp_pre_arr)
+                    tgt_ok_pre = ~np.isnan(rt_pre_arr)
+                    for k in K_LIST:
+                        m = min(k, Rp_pre_arr.shape[1])
+                        if m <= 0:
+                            continue
+                        Xp = Rp_pre_arr[:, :m]
+                        wk = w_base[:m]
+                        denom_w = float(np.sum(wk))
+                        if denom_w <= 0:
+                            continue
+                        mask_pre = tgt_ok_pre & np.all(neigh_ok_pre[:, :m], axis=1)
+                        if not np.any(mask_pre):
+                            continue
+                        rt_p = rt_pre_arr[mask_pre]
+                        Xp_v = Xp[mask_pre]
+                        wnorm = (wk / denom_w).astype(np.float32)
+                        port_p = Xp_v @ wnorm
+                        den = float(np.dot(port_p, port_p))
+                        if den > 0:
+                            num = float(np.dot(port_p, rt_p))
+                            b_hat[m] = num / den
+        # default b=1 for any k lacking a pre-window estimate
 
         for h_name, delta in HORIZONS.items():
             rwin = R[(R.index > date_end) & (R.index <= date_end + delta)]
@@ -127,7 +178,9 @@ for key, g in tqdm(dfc.groupby(group_cols), total=total_groups, desc="dates", nc
                 X = X[mask]
                 wnorm = (wk / denom).astype(np.float32)
                 port = X @ wnorm  # T
-                diff = rt - port
+                # Scale hedge by b_hat estimated on pre-window (fallback to 1.0)
+                bh = b_hat.get(m, 1.0)
+                diff = rt - (bh * port)
                 n_obs = int(diff.shape[0])
                 if n_obs < 5:
                     continue

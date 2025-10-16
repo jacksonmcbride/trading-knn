@@ -1,63 +1,99 @@
 from pathlib import Path
 import pandas as pd
-import numpy as np
-
-root = Path(__file__).resolve().parents[2]
-path = root / "results" / "hedge_eval" / "stock_metrics.parquet"
+import math
 
 try:
-    df = pd.read_parquet(path)
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
+root = Path(__file__).resolve().parents[2]
+in_path = root / "results" / "hedge_eval" / "stock_metrics.parquet"
+counts_path = root / "results" / "hedge_eval" / "counts.csv"
+ticker_counts_path = root / "results" / "hedge_eval" / "ticker_counts.csv"
+obs_stats_path = root / "results" / "hedge_eval" / "n_obs_by_group.csv"
+plot_path = root / "results" / "hedge_eval" / "ticker_counts.png"
+
+try:
+    df = pd.read_parquet(in_path)
 except FileNotFoundError:
-    print(f"Not found: {path}")
+    print(f"Not found: {in_path}")
     raise SystemExit(1)
 except Exception as e:
-    print(f"Error reading {path}: {e}")
+    print(f"Error reading {in_path}: {e}")
     raise SystemExit(1)
 
-# Identify available improvement metrics (some may not be present yet)
-improve_cols = [c for c in ["he", "te_ratio", "mdd_reduct", "var95_reduct", "alpha_ann"] if c in df.columns]
-context_cols = [c for c in ["te_ann", "mdd", "var_95"] if c in df.columns]
+# Aggregate counts by half_life, k, and lookforward horizon
+counts = (
+    df.groupby(["half_life", "k", "horizon"], dropna=False)
+      .size()
+      .reset_index(name="count")
+      .sort_values(["half_life", "k", "horizon"])
+)
 
-if not improve_cols and not context_cols:
-    print("No expected metrics found in file.")
-    raise SystemExit(1)
+# Per-ticker counts (by target)
+ticker_counts = (
+    df.groupby(["target"], dropna=False)
+      .size()
+      .reset_index(name="count")
+      .sort_values(["count", "target"], ascending=[True, True])
+)
 
-def summarize_group(g: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    out = []
-    for c in cols:
-        s = g[c].astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-        n = int(s.shape[0])
-        if n == 0:
-            out.append({"metric": c, "n": 0, "mean": np.nan, "std": np.nan, "ci_lo": np.nan, "ci_hi": np.nan})
-            continue
-        m = float(s.mean())
-        sd = float(s.std(ddof=1)) if n > 1 else 0.0
-        se = sd / np.sqrt(n) if n > 0 else np.nan
-        ci = 1.96 * se if np.isfinite(se) else np.nan
-        out.append({"metric": c, "n": n, "mean": m, "std": sd, "ci_lo": m - ci if np.isfinite(ci) else np.nan, "ci_hi": m + ci if np.isfinite(ci) else np.nan})
-    return pd.DataFrame(out)
+# Number of observations within each group (check for consistency)
+obs_stats = (
+    df.groupby(["half_life", "k", "horizon"], dropna=False)
+      .agg(
+          num_rows=("n_obs", "size"),
+          min_n_obs=("n_obs", "min"),
+          max_n_obs=("n_obs", "max"),
+          mean_n_obs=("n_obs", "mean"),
+          median_n_obs=("n_obs", "median"),
+          nunique_n_obs=("n_obs", "nunique"),
+      )
+      .reset_index()
+      .sort_values(["half_life", "k", "horizon"])
+)
 
-grp_keys = ["half_life", "k", "horizon"]
-have_keys = [k for k in grp_keys if k in df.columns]
-if len(have_keys) < 3:
-    print("Missing grouping keys; require half_life, k, horizon.")
-    raise SystemExit(1)
+# Write outputs
+counts.to_csv(counts_path, index=False)
+ticker_counts.to_csv(ticker_counts_path, index=False)
+obs_stats.to_csv(obs_stats_path, index=False)
 
-rows = []
-for keys, g in df.groupby(have_keys):
-    if not isinstance(keys, tuple):
-        keys = (keys,)
-    key_map = dict(zip(have_keys, keys))
-    if improve_cols:
-        summ = summarize_group(g, improve_cols)
-        for _, r in summ.iterrows():
-            rows.append({**key_map, **r.to_dict()})
-    if context_cols:
-        summ_ctx = summarize_group(g, context_cols)
-        for _, r in summ_ctx.iterrows():
-            rows.append({**key_map, **r.to_dict()})
+print(f"Wrote counts: {counts_path}")
+print(f"Wrote per-ticker counts: {ticker_counts_path}")
+print(f"Wrote n_obs stats: {obs_stats_path}")
 
-summary = pd.DataFrame(rows).sort_values(["horizon", "metric", "half_life", "k"]).reset_index(drop=True)
+# Print simple n_obs consistency check summary
+same_obs_groups = int((obs_stats["nunique_n_obs"] == 1).sum())
+total_groups = int(obs_stats.shape[0])
+print(f"Groups with constant n_obs across rows: {same_obs_groups} / {total_groups}")
 
-print("Summary (mean, sd, 95% CI) by half_life, k, horizon for each metric:")
-print(summary.to_string(index=False))
+# Plot distribution of ticker counts, ordered least to most
+if plt is not None:
+    try:
+        out_dir = plot_path.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Large figure to accommodate many tickers; rotate labels if needed
+        fig_w = max(12, min(48, len(ticker_counts) * 0.05))
+        fig_h = 6
+        plt.figure(figsize=(fig_w, fig_h))
+        plt.bar(range(len(ticker_counts)), ticker_counts["count"].to_numpy())
+        plt.title("Distribution of counts per ticker (target)")
+        plt.xlabel("Tickers (sorted ascending)")
+        plt.ylabel("Count")
+        # Optionally add sparse x tick labels for readability
+        if len(ticker_counts) <= 50:
+            plt.xticks(range(len(ticker_counts)), ticker_counts["target"].tolist(), rotation=90, fontsize=8)
+        else:
+            step = max(1, len(ticker_counts) // 50)
+            idxs = list(range(0, len(ticker_counts), step))
+            labels = ticker_counts["target"].iloc[idxs].tolist()
+            plt.xticks(idxs, labels, rotation=90, fontsize=7)
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=150)
+        plt.close()
+        print(f"Saved ticker count distribution plot: {plot_path}")
+    except Exception as e:
+        print(f"Plotting failed: {e}")
+else:
+    print("matplotlib not available; skipped plot generation.")
