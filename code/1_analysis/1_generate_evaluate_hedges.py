@@ -216,18 +216,24 @@ def find_neighbors(weighted_df: pd.DataFrame, target: str, k: int = 30) -> dict:
     if target not in weighted_df.columns:
         return {}
     t = pd.to_numeric(weighted_df[target], errors="coerce").to_numpy(dtype=float)
-    dists = []
-    for c in weighted_df.columns:
-        if c == target:
-            continue
-        x = pd.to_numeric(weighted_df[c], errors="coerce").to_numpy(dtype=float)
-        m = np.isfinite(t) & np.isfinite(x)
-        if not np.any(m):
-            continue
-        d = float(np.linalg.norm(t[m] - x[m]))
-        dists.append((c, d))
-    dists.sort(key=lambda z: z[1])
-    return {c: d for c, d in dists[:k]}
+    other_cols = [c for c in weighted_df.columns if c != target]
+    if not other_cols:
+        return {}
+    X = pd.DataFrame({c: pd.to_numeric(weighted_df[c], errors="coerce") for c in other_cols}).to_numpy(dtype=float)
+    tm = np.isfinite(t)[:, None]
+    Xm = np.isfinite(X)
+    M = tm & Xm
+    # Differences via broadcasting; zero-out where not overlapping
+    D = X - t[:, None]
+    D[~M] = 0.0
+    # Exclude columns with no overlap
+    counts = M.sum(axis=0)
+    dsq = (D * D).sum(axis=0)
+    dsq[counts == 0] = np.inf
+    dists = np.sqrt(dsq)
+    order = np.argsort(dists)
+    top = [(other_cols[i], float(dists[i])) for i in order[:min(k, len(other_cols))] if np.isfinite(dists[i])]
+    return {c: d for c, d in top}
 
 def neighbors_by_halflife(df: pd.DataFrame, target: str, halflifes: list[int], k: int = 30) -> dict:
     """For each half-life, compute weighted lookback (6×HL) and return top-k neighbor distances.
@@ -243,76 +249,154 @@ def neighbors_by_halflife(df: pd.DataFrame, target: str, halflifes: list[int], k
         lam = np.log(2.0) / float(hl)
         n = look.shape[0]
         w = pd.Series(np.exp(-lam * np.arange(n - 1, -1, -1, dtype=float)), index=look.index, dtype="float64")
-        # Weighted z-score per column within lookback (backward-only normalization)
-        z_cols = {}
-        for c in look.columns:
-            x = pd.to_numeric(look[c], errors="coerce")
-            m = np.isfinite(x)
-            if not np.any(m):
-                z_cols[c] = x.astype(float)
-                continue
-            ww = w[m]
-            xv = x[m].to_numpy(dtype=float)
-            sw = float(ww.sum())
-            mu = float((ww * xv).sum() / sw) if sw > 0 else float(np.nan)
-            var = float((ww * (xv - mu) * (xv - mu)).sum() / sw) if sw > 0 else float(np.nan)
-            sd = float(np.sqrt(var)) if var > 0 else float(np.nan)
-            z = x.astype(float).copy()
-            if np.isfinite(sd) and sd > 0:
-                z[m] = (x[m] - mu) / sd
-            else:
-                z[m] = 0.0
-            z_cols[c] = z
-        z_df = pd.DataFrame(z_cols, index=look.index)
+        # Weighted z-score per column within lookback (vectorized)
+        X = look.to_numpy(dtype=float)
+        Fin = np.isfinite(X)
+        wv = w.to_numpy(dtype=float)[:, None]
+        sw = (wv * Fin).sum(axis=0)
+        X_f = np.where(Fin, X, 0.0)
+        mu = (wv * X_f).sum(axis=0) / np.where(sw > 0, sw, np.nan)
+        diff = np.where(Fin, X - mu, 0.0)
+        var = (wv * diff * diff).sum(axis=0) / np.where(sw > 0, sw, np.nan)
+        sd = np.sqrt(var)
+        sd_pos = np.isfinite(sd) & (sd > 0)
+        sd_row = sd[None, :]
+        mu_row = mu[None, :]
+        Z = np.full_like(X, np.nan, dtype=float)
+        # Compute only for columns with valid sd to avoid invalid divisions
+        valid_idx = np.flatnonzero(sd_pos)
+        if valid_idx.size > 0:
+            Z_valid = (X[:, valid_idx] - mu_row[:, valid_idx]) / sd_row[:, valid_idx]
+            Fin_valid = Fin[:, valid_idx]
+            Z_slice = Z[:, valid_idx]
+            Z_slice[Fin_valid] = Z_valid[Fin_valid]
+            Z[:, valid_idx] = Z_slice
+        # For columns with invalid sd but finite data, set z to 0
+        invalid_idx = np.flatnonzero(~sd_pos)
+        if invalid_idx.size > 0:
+            Fin_invalid = Fin[:, invalid_idx]
+            Z_slice = Z[:, invalid_idx]
+            Z_slice[Fin_invalid] = 0.0
+            Z[:, invalid_idx] = Z_slice
+        z_df = pd.DataFrame(Z, index=look.index, columns=look.columns)
         out[hl] = find_neighbors(z_df, target, k=k)
     return out
 
 if __name__ == "__main__":
-    # Weekly test across 2024: random target per week, normalized backward lookback per half-life
+    # Iterate years from 1980: weekly dates, random target per week; save per-year CSVs
     import pandas as pd
     from pathlib import Path
     root = Path(__file__).resolve().parents[2]
     s_path = root / "data" / "processed" / "returns" / "stock_returns.parquet"
+    out_dir = root / "results" / "hedge_results"
     try:
         rng = np.random.default_rng(7)
         s_df = pd.read_parquet(s_path)
         s_df.index = pd.to_datetime(s_df.index)
-        dates = pd.date_range("2024-01-01", "2024-12-31", freq="7D")
-        halflifes = [5, 30, 90]
+        first_year = max(1980, int(s_df.index.min().year))
+        last_year = int(s_df.index.max().year)
+        years = list(range(first_year, last_year + 1))
+        halflifes = [5, 30, 90, 180, 365]
         ks = [1, 3, 5, 10, 30]
         horizons = [5, 21, 126, 252]
         tickers = list(s_df.columns)
-        rows = []
-        with tqdm(total=len(dates), desc="dates", ncols=80) as td:
-            for d in dates:
-                target = tickers[int(rng.integers(0, len(tickers)))]
-                lookback_df = s_df[s_df.index <= d]
-                for hl in halflifes:
-                    dist_dict = neighbors_by_halflife(lookback_df, target, [hl], k=30).get(hl, {})
-                    if not dist_dict:
-                        continue
-                    neigh = list(dist_dict.keys())
-                    w_by_k = make_weights(dist_dict, ks)
-                    fwd_df = subset_returns(s_df, None, d, target, neigh, end_date=d + pd.Timedelta(days=365), neighbors_source="stock")
-                    t_series, port_dict = build_series(fwd_df, target, [w_by_k.get(k, {}) for k in ks])
-                    for i, (label, p) in enumerate(port_dict.items()):
-                        k_val = ks[i]
-                        neigh_list = list(w_by_k.get(k_val, {}).keys())
-                        for m in evaluate_horizons(t_series, p, horizons):
-                            rows.append({
-                                "date": d.date(),
-                                "target": target,
-                                "half_life": hl,
-                                "k": k_val,
-                                "window": m["window_len"],
-                                "n_obs": m["n_obs"],
-                                "he": m["he"],
-                                "te_ann": m["te_ann"],
-                                "neighbors": ",".join(neigh_list),
-                            })
-                td.update(1)
-        out = pd.DataFrame(rows).sort_values(["date", "half_life", "k", "window"]).reset_index(drop=True)
-        print(f"Rows: {len(out)}")
-        print(out.to_string(index=False))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with tqdm(total=len(years), desc="years", ncols=80) as ty:
+            for year in years:
+                rows = []
+                dates = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="7D")
+                with tqdm(total=len(dates), desc=f"dates {year}", leave=False, ncols=80) as td:
+                    for d in dates:
+                        # Pick a target with sufficient history for the shortest half-life
+                        L_short = int(6 * min(halflifes))
+                        lookback_df = s_df[s_df.index <= d]
+                        short_win = lookback_df.tail(L_short)
+                        if short_win.empty:
+                            print(f"{d.date()}: no lookback window for shortest half-life; skip")
+                            td.update(1)
+                            continue
+                        counts = short_win.notna().sum(axis=0)
+                        elig = counts[counts >= L_short].index.tolist()
+                        if not elig:
+                            print(f"{d.date()}: 0 eligible tickers for shortest half-life; skip")
+                            td.update(1)
+                            continue
+                        target = elig[int(rng.integers(0, len(elig)))]
+                        print(f"{d.date()}: eligible={len(elig)} target={target}")
+                        for hl in halflifes:
+                            dist_dict = neighbors_by_halflife(lookback_df, target, [hl], k=30).get(hl, {})
+                            if not dist_dict:
+                                continue
+                            neigh = list(dist_dict.keys())
+                            w_by_k = make_weights(dist_dict, ks)
+                            # Estimate beta on backward window (last 6*hl rows) per k
+                            L = int(6 * hl)
+                            pre_win = lookback_df.tail(L)
+                            betas = {}
+                            if not pre_win.empty and target in pre_win.columns:
+                                t_pre = pd.to_numeric(pre_win[target], errors="coerce")
+                                for k_val, wdict in w_by_k.items():
+                                    if not wdict:
+                                        betas[k_val] = 1.0
+                                        continue
+                                    cols = [c for c in wdict.keys() if c in pre_win.columns]
+                                    if not cols:
+                                        betas[k_val] = 1.0
+                                        continue
+                                    p_pre = pre_win[cols].mul(pd.Series(wdict)[cols].values, axis=1).sum(axis=1)
+                                    t_arr = pd.to_numeric(t_pre, errors="coerce").to_numpy(dtype=float)
+                                    p_arr = pd.to_numeric(p_pre, errors="coerce").to_numpy(dtype=float)
+                                    m = np.isfinite(t_arr) & np.isfinite(p_arr)
+                                    if not np.any(m):
+                                        betas[k_val] = 1.0
+                                        continue
+                                    num = float(np.dot(p_arr[m], t_arr[m]))
+                                    den = float(np.dot(p_arr[m], p_arr[m]))
+                                    betas[k_val] = (num / den) if den > 0 else 1.0
+                            fwd_df = subset_returns(s_df, None, d, target, neigh, end_date=d + pd.Timedelta(days=365), neighbors_source="stock")
+                            t_series, port_dict = build_series(fwd_df, target, [w_by_k.get(k, {}) for k in ks])
+                            for i, (label, p) in enumerate(port_dict.items()):
+                                k_val = ks[i]
+                                neigh_list = list(w_by_k.get(k_val, {}).keys())
+                                # Scale forward portfolio by beta estimated on backward window
+                                beta = betas.get(k_val, 1.0)
+                                p_scaled = p * beta
+                                for m in evaluate_horizons(t_series, p_scaled, horizons):
+                                    row = {
+                                        "date": d.date(),
+                                        "target": target,
+                                        "half_life": hl,
+                                        "k": k_val,
+                                        "window": m.get("window_len"),
+                                        "n_obs": m.get("n_obs"),
+                                        "he": m.get("he"),
+                                        "te_ann": m.get("te_ann"),
+                                        "neighbors": ",".join(neigh_list),
+                                    }
+                                    # Include additional metrics if present
+                                    extra_keys = [
+                                        "te_ratio",
+                                        "var_reduct_abs",
+                                        "mdd",
+                                        "mdd_reduct",
+                                        "mdd_abs_reduct",
+                                        "var_95",
+                                        "var95_reduct",
+                                        "var95_abs_reduct",
+                                        "alpha_ann",
+                                        "hit_rate",
+                                        "cum_return_target",
+                                        "cum_return_portfolio",
+                                        "cum_return_diff",
+                                    ]
+                                    for kx in extra_keys:
+                                        if kx in m:
+                                            row[kx] = m[kx]
+                                    rows.append(row)
+                        td.update(1)
+                out = pd.DataFrame(rows).sort_values(["date", "half_life", "k", "window"]).reset_index(drop=True)
+                out_path = out_dir / f"{year}.csv"
+                out.to_csv(out_path, index=False)
+                ty.update(1)
     except Exception as e:
-        print(f"Weekly test skipped: {e}")
+        print(f"Yearly run skipped: {e}")

@@ -10,6 +10,7 @@
 *.json
 *.feather
 *.parquet
+*.csv
 # Ignore common image files
 *.png
 *.jpg
