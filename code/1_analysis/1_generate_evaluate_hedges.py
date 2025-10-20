@@ -3,6 +3,8 @@ import pandas as pd
 from tqdm import tqdm
 
 EPS = 1e-12
+# Limit neighbor search to top-N candidate tickers by data availability in lookback
+CANDIDATE_CAP = 1000
 
 
 def _max_drawdown(cum: np.ndarray) -> float:
@@ -211,31 +213,44 @@ def make_weights(distances: dict, ks: list[int], eps: float = 1e-12) -> dict:
     return out
 
 
-def find_neighbors(weighted_df: pd.DataFrame, target: str, k: int = 30) -> dict:
-    """Return dict of {ticker: distance} for k nearest neighbors of target using L2 over overlapping rows."""
+def find_neighbors(weighted_df: pd.DataFrame, target: str, k: int = 60) -> dict:
+    """Return dict of {ticker: distance} using correlation distance over overlapping rows.
+    Uses distance = 1 - |corr(target, asset)| (smaller is stronger relationship).
+    """
     if target not in weighted_df.columns:
         return {}
     t = pd.to_numeric(weighted_df[target], errors="coerce").to_numpy(dtype=float)
     other_cols = [c for c in weighted_df.columns if c != target]
     if not other_cols:
         return {}
-    X = pd.DataFrame({c: pd.to_numeric(weighted_df[c], errors="coerce") for c in other_cols}).to_numpy(dtype=float)
+    X = pd.DataFrame({c: pd.to_numeric(weighted_df[c], errors="coerce") for c in other_cols}).to_numpy(dtype=np.float32)
     tm = np.isfinite(t)[:, None]
     Xm = np.isfinite(X)
     M = tm & Xm
-    # Differences via broadcasting; zero-out where not overlapping
-    D = X - t[:, None]
-    D[~M] = 0.0
-    # Exclude columns with no overlap
+    # Weighted by overlap only: compute corr per column w.r.t target
+    prod = t[:, None] * X
+    prod[~M] = 0.0
+    num = prod.sum(axis=0)
+    t2 = (t * t)[:, None]
+    x2 = (X * X)
+    t2[~tm] = 0.0
+    x2[~Xm] = 0.0
+    den_t = (t2 * M).sum(axis=0)
+    den_x = (x2 * M).sum(axis=0)
+    den = np.sqrt(den_t * den_x)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        corr = num / den
+    corr = np.clip(corr, -1.0, 1.0)
     counts = M.sum(axis=0)
-    dsq = (D * D).sum(axis=0)
-    dsq[counts == 0] = np.inf
-    dists = np.sqrt(dsq)
-    order = np.argsort(dists)
-    top = [(other_cols[i], float(dists[i])) for i in order[:min(k, len(other_cols))] if np.isfinite(dists[i])]
+    min_overlap = 10
+    corr[(den <= 0) | (counts < min_overlap)] = np.nan
+    dist = 1.0 - np.abs(corr)
+    dist[~np.isfinite(dist)] = np.inf
+    order = np.argsort(dist)
+    top = [(other_cols[i], float(dist[i])) for i in order[:min(k, len(other_cols))] if np.isfinite(dist[i])]
     return {c: d for c, d in top}
 
-def neighbors_by_halflife(df: pd.DataFrame, target: str, halflifes: list[int], k: int = 30) -> dict:
+def neighbors_by_halflife(df: pd.DataFrame, target: str, halflifes: list[int], k: int = 60) -> dict:
     """For each half-life, compute weighted lookback (6×HL) and return top-k neighbor distances.
     Assumes df is indexed by time in ascending order; uses the last rows as lookback.
     """
@@ -288,16 +303,16 @@ if __name__ == "__main__":
     from pathlib import Path
     root = Path(__file__).resolve().parents[2]
     s_path = root / "data" / "processed" / "returns" / "stock_returns.parquet"
-    out_dir = root / "results" / "hedge_results"
+    out_dir = root / "results" / "hedge_eval"
     try:
         rng = np.random.default_rng(7)
         s_df = pd.read_parquet(s_path)
         s_df.index = pd.to_datetime(s_df.index)
-        first_year = max(1980, int(s_df.index.min().year))
+        first_year = max(1989, int(s_df.index.min().year))
         last_year = int(s_df.index.max().year)
         years = list(range(first_year, last_year + 1))
-        halflifes = [5, 30, 90, 180, 365]
-        ks = [1, 3, 5, 10, 30]
+        halflifes = [5, 30, 90, 180, 365, 720]
+        ks = [1, 3, 5, 10, 30, 60]
         horizons = [5, 21, 126, 252]
         tickers = list(s_df.columns)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -324,44 +339,19 @@ if __name__ == "__main__":
                         target = elig[int(rng.integers(0, len(elig)))]
                         print(f"{d.date()}: eligible={len(elig)} target={target}")
                         for hl in halflifes:
-                            dist_dict = neighbors_by_halflife(lookback_df, target, [hl], k=30).get(hl, {})
+                            dist_dict = neighbors_by_halflife(lookback_df, target, [hl], k=60).get(hl, {})
                             if not dist_dict:
                                 continue
                             neigh = list(dist_dict.keys())
+                            # Use inverse-distance weights per k (minimal, fast)
                             w_by_k = make_weights(dist_dict, ks)
-                            # Estimate beta on backward window (last 6*hl rows) per k
-                            L = int(6 * hl)
-                            pre_win = lookback_df.tail(L)
-                            betas = {}
-                            if not pre_win.empty and target in pre_win.columns:
-                                t_pre = pd.to_numeric(pre_win[target], errors="coerce")
-                                for k_val, wdict in w_by_k.items():
-                                    if not wdict:
-                                        betas[k_val] = 1.0
-                                        continue
-                                    cols = [c for c in wdict.keys() if c in pre_win.columns]
-                                    if not cols:
-                                        betas[k_val] = 1.0
-                                        continue
-                                    p_pre = pre_win[cols].mul(pd.Series(wdict)[cols].values, axis=1).sum(axis=1)
-                                    t_arr = pd.to_numeric(t_pre, errors="coerce").to_numpy(dtype=float)
-                                    p_arr = pd.to_numeric(p_pre, errors="coerce").to_numpy(dtype=float)
-                                    m = np.isfinite(t_arr) & np.isfinite(p_arr)
-                                    if not np.any(m):
-                                        betas[k_val] = 1.0
-                                        continue
-                                    num = float(np.dot(p_arr[m], t_arr[m]))
-                                    den = float(np.dot(p_arr[m], p_arr[m]))
-                                    betas[k_val] = (num / den) if den > 0 else 1.0
                             fwd_df = subset_returns(s_df, None, d, target, neigh, end_date=d + pd.Timedelta(days=365), neighbors_source="stock")
                             t_series, port_dict = build_series(fwd_df, target, [w_by_k.get(k, {}) for k in ks])
                             for i, (label, p) in enumerate(port_dict.items()):
                                 k_val = ks[i]
                                 neigh_list = list(w_by_k.get(k_val, {}).keys())
-                                # Scale forward portfolio by beta estimated on backward window
-                                beta = betas.get(k_val, 1.0)
-                                p_scaled = p * beta
-                                for m in evaluate_horizons(t_series, p_scaled, horizons):
+                                # Evaluate forward on regression-weighted portfolio
+                                for m in evaluate_horizons(t_series, p, horizons):
                                     row = {
                                         "date": d.date(),
                                         "target": target,

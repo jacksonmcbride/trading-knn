@@ -2,7 +2,7 @@ from pathlib import Path
 import csv
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.ndates as mdates
+import matplotlib.dates as mdates
 from tqdm import tqdm
 import numpy as np
 
@@ -176,6 +176,7 @@ def main() -> None:
         folder = raw_dir / asset_type
         rets = []
         starts = []
+        details = []
         files = [f for f in folder.glob("*.csv") if f.stem.upper() in allowed]
         for file in tqdm(files, desc=asset_type.upper(), ncols=80):
             try:
@@ -183,6 +184,7 @@ def main() -> None:
                     rdr = csv.DictReader(f)
                     first = None
                     last = None
+                    row_count = 0
                     for row in rdr:
                         price_raw = row.get("adj_close")
                         date_raw = row.get("date")
@@ -194,6 +196,7 @@ def main() -> None:
                             continue
                         if price <= 0:
                             continue
+                        row_count += 1
                         if first is None:
                             first = (date_raw, price)
                         last = (date_raw, price)
@@ -206,12 +209,22 @@ def main() -> None:
                         ann_ret_pct = ((last[1] / first[1]) ** (1.0 / years) - 1.0) * 100.0
                         rets.append(ann_ret_pct)
                         starts.append(first_dt)
+                        details.append({
+                            "ticker": file.stem.upper(),
+                            "rows": row_count,
+                            "first_date": first_dt,
+                            "last_date": last_dt,
+                            "years": years,
+                            "first_price": first[1],
+                            "last_price": last[1],
+                            "ann_ret_pct": ann_ret_pct,
+                        })
             except Exception:
                 continue
-        return rets, starts
+        return rets, starts, details
 
-    etf_avg_ret_pct, etf_start_dates = returns_and_starts("etf", valid_etf)
-    stock_avg_ret_pct, stock_start_dates = returns_and_starts("stock", valid_stock)
+    etf_avg_ret_pct, etf_start_dates, etf_details = returns_and_starts("etf", valid_etf)
+    stock_avg_ret_pct, stock_start_dates, stock_details = returns_and_starts("stock", valid_stock)
 
     etf_start_nums = mdates.date2num(pd.to_datetime(etf_start_dates).to_pydatetime()) if len(etf_start_dates) else []
     stock_start_nums = mdates.date2num(pd.to_datetime(stock_start_dates).to_pydatetime()) if len(stock_start_dates) else []
@@ -227,6 +240,39 @@ def main() -> None:
     # Trim extreme annual returns for stability in plots/stats
     etf_ann_trim = trim_percentile(etf_avg_ret_pct, 1.0, 99.0)
     stock_ann_trim = trim_percentile(stock_avg_ret_pct, 1.0, 99.0)
+
+    # Diagnostics: investigate potentially incorrect negative averages for stocks
+    try:
+        if stock_details:
+            sd = pd.DataFrame(stock_details)
+            sd_sorted = sd.sort_values("ann_ret_pct")
+            worst = sd_sorted.head(10)
+            # Compute last recorded daily return and NaN counts from parquet for these tickers
+            print("\n=== Diagnostics: Worst Performing Stocks (by annualized return) ===")
+            for _, row in worst.iterrows():
+                tkr = row["ticker"]
+                last_ret = None
+                n_nans = None
+                if tkr in stock_df.columns:
+                    try:
+                        last_ret = float(stock_df.loc[stock_last, tkr])
+                    except Exception:
+                        last_ret = None
+                    try:
+                        n_nans = int(stock_df[tkr].isna().sum())
+                    except Exception:
+                        n_nans = None
+                print(
+                    f"{tkr}: rows={int(row['rows'])}, first={row['first_date'].date()} @ {row['first_price']:.4f}, "
+                    f"last={row['last_date'].date()} @ {row['last_price']:.4f}, years={row['years']:.2f}, "
+                    f"ann_ret={row['ann_ret_pct']:.2f}%, last_daily_ret={'' if last_ret is None else f'{last_ret*100:.2f}%'}"
+                    f"{'' if n_nans is None else f', n_nan={n_nans}'}"
+                )
+            # Aggregate checks
+            sd_neg = (sd["ann_ret_pct"] < 0).sum()
+            print(f"Total stocks with negative annualized return: {sd_neg} of {sd.shape[0]}")
+    except Exception as e:
+        print(f"Diagnostics failed: {e}")
 
     # Save minimal histograms with average line/label
     plot_histogram(
