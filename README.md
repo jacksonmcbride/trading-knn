@@ -1,4 +1,9 @@
-# Trading- Project
+# Hedging KNN
+**Releases**  
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17404455.svg)](https://doi.org/10.5281/zenodo.17404455)  
+**Version:** [v1.0.0](https://github.com/jacksonmcbride/hedging-knn/releases/tag/v1.0.0)  
+**Repository:** [jacksonmcbride/hedging-knn](https://github.com/jacksonmcbride/hedging-knn)
+
 
 ## Overview
 End‑to‑end pipeline to analyze whether KNN can generate effective hedges from historical return series. The workflow builds a universe, fetches data, computes returns, selects neighbors via correlation distance, and evaluates hedges out‑of‑sample across years, lookforward windows, ks, and half‑lives. Summary tables and plots are produced for use in a paper.
