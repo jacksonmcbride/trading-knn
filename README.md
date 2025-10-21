@@ -10,7 +10,7 @@ End‑to‑end pipeline to analyze whether KNN can generate effective hedges fro
 
 Key choices (current defaults)
 - Neighbor selection: correlation distance `1 − |corr|` on half‑life‑weighted, backward lookback windows.
-- Portfolio weights: inverse‑distance (sum to 1, closer neighbors get higher weight).
+– Portfolio weights: ridge-regularized regression coefficients estimated from weighted lookback returns, scaled to maintain dollar-neutral exposure.
 
 ## Layout
 ```
